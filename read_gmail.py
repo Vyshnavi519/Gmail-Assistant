@@ -30,6 +30,9 @@ from PyPDF2 import PdfReader
 from docx import Document
 from PIL import Image
 import pytesseract
+from PIL import Image
+import pytesseract
+
 
 
 
@@ -86,7 +89,7 @@ def collect_all_parts(payload, out_list):
         # single part (could be an attachment or inline)
         out_list.append(payload)
 
-
+'''
 def save_attachment(service, msg_id, part, save_dir):
     """
     Saves an attachment to disk. Handles parts where body has 'attachmentId' or 'data'.
@@ -118,8 +121,58 @@ def save_attachment(service, msg_id, part, save_dir):
         f.write(data_bytes)
 
     return filename, data_bytes
+'''
+#'''#  this code is updated if we want to extract text from the image
+def save_attachment(service, msg_id, part, save_dir):
+    """
+    Saves an attachment to disk. Handles parts where body has 'attachmentId' or 'data'.
+    Returns tuple (filename, bytes_data)
+    """
+    filename = part.get("filename") or "unknown"
+    filename = sanitize_filename(filename)
+    body = part.get("body", {})
+
+    data_bytes = None
+
+    if "attachmentId" in body:
+        # Official attachment reference — fetch via attachments.get
+        att_id = body["attachmentId"]
+        att = service.users().messages().attachments().get(userId='me', messageId=msg_id, id=att_id).execute()
+        raw = att.get("data")
+        if raw:
+            data_bytes = base64.urlsafe_b64decode(raw.encode("UTF-8"))
+    elif body.get("data"):
+        # Inline small attachment
+        raw = body.get("data")
+        data_bytes = base64.urlsafe_b64decode(raw.encode("UTF-8"))
+
+    if data_bytes is None:
+        return None, None
+
+    # Save the file to disk
+    file_path = os.path.join(save_dir, filename)
+
+    # Handle saving the image
+    if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+        with open(file_path, "wb") as f:
+            f.write(data_bytes)
+
+        # Extract text from image (optional OCR step)
+        image_text = extract_text_from_image(data_bytes)
+        if image_text:
+            # Save extracted text from image as a .txt file
+            txt_filename = f"{os.path.splitext(filename)[0]}_extracted.txt"
+            with open(os.path.join(save_dir, txt_filename), "w", encoding="utf-8") as txt_file:
+                txt_file.write(image_text)
+    else:
+        # For non-image attachments (other file types like PDF, DOCX, etc.), save them normally
+        with open(file_path, "wb") as f:
+            f.write(data_bytes)
+
+    return filename, data_bytes
 
 
+#'''
 def extract_text_from_bytes(data_bytes: bytes, filename: str) -> str:
     """Extract text from bytes based on the file extension. Returns extracted text or empty string."""
     lower = filename.lower()
@@ -155,7 +208,7 @@ def extract_text_from_bytes(data_bytes: bytes, filename: str) -> str:
     except Exception as e:
         return f"[Error extracting text: {e}]"
 
-
+'''
 def save_email_folder(service, message):
     """
     Given a Gmail message resource (as returned by messages.get with format='full'),
@@ -228,6 +281,87 @@ def save_email_folder(service, message):
 
     print(f"Saved email -> {folder_name} (body + {len(extracted_texts)} extracted attachments)")
     return folder_name
+'''
+
+
+def save_email_folder(service, message):
+    """
+    Given a Gmail message resource (as returned by messages.get with format='full'),
+    create a folder and save metadata, body, attachments and extracted text.
+    """
+    msg_id = message.get("id")
+    thread_id = message.get("threadId", "")
+    internal_date = message.get("internalDate")  # milliseconds-since-epoch as string
+    date_readable = ""
+    if internal_date:
+        try:
+            ts = int(internal_date) / 1000.0
+            date_readable = datetime.utcfromtimestamp(ts).strftime("%Y%m%d_%H%M%S")
+        except:
+            date_readable = internal_date
+
+    # Build a friendly folder name: emails/email_<msgid>_<date> (safe)
+    folder_name = f"emails/email_{sanitize_filename(msg_id)}"
+    if date_readable:
+        folder_name += f"_{date_readable}"
+    ensure_dir(folder_name)
+
+    # Extract headers metadata
+    headers = message.get("payload", {}).get("headers", [])
+    meta = {}
+    for h in headers:
+        name = h.get("name", "").lower()
+        if name in ["from", "to", "subject", "date", "message-id"]:
+            meta[name] = h.get("value")
+    meta["id"] = msg_id
+    meta["threadId"] = thread_id
+    meta["snippet"] = message.get("snippet", "")
+
+    # Save metadata.json
+    with open(os.path.join(folder_name, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    # Save body text (plain text if possible)
+    body_text = get_email_body_from_payload(message.get("payload", {})) or ""
+    with open(os.path.join(folder_name, "body.txt"), "w", encoding="utf-8") as f:
+        f.write(body_text)
+
+    # Now gather all parts and save attachments & extracted text
+    parts_list = []
+    collect_all_parts(message.get("payload", {}), parts_list)
+
+    extracted_texts = []
+
+    for part in parts_list:
+        # decide if this part is an attachment (has filename) or has attachmentId
+        filename = part.get("filename")
+        body = part.get("body", {})
+        if (filename and (body.get("attachmentId") or body.get("data"))):
+            fname, bytes_data = save_attachment(service, msg_id, part, folder_name)
+            if fname and bytes_data:
+                # Extract text from non-image attachments if needed
+                extracted = extract_text_from_bytes(bytes_data, fname)
+                extracted_texts.append({
+                    "attachment": fname,
+                    "text": extracted
+                })
+                # Save extracted text file
+                txt_name = f"extracted_{os.path.splitext(fname)[0]}.txt"
+                with open(os.path.join(folder_name, txt_name), "w", encoding="utf-8") as tx:
+                    tx.write(extracted)
+    # Save combined extracted text file (concatenated)
+    combined = "\n\n".join([et["text"] for et in extracted_texts if et["text"]])
+    with open(os.path.join(folder_name, "extracted_full.txt"), "w", encoding="utf-8") as comb:
+        comb.write(combined)
+
+    print(f"Saved email -> {folder_name} (body + {len(extracted_texts)} extracted attachments)")
+    return folder_name
+
+
+
+
+
+
 
 
 def main():
@@ -264,6 +398,22 @@ def main():
         # fetch full message (format='full' is default) so we can access parts/attachments
         full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
         save_email_folder(service, full)
+
+
+#for image reading
+def extract_text_from_image(image_bytes: bytes) -> str:
+    """
+    Extract text from an image using OCR (pytesseract).
+    """
+    try:
+        # Load image from byte data
+        image = Image.open(io.BytesIO(image_bytes))
+        text = pytesseract.image_to_string(image)
+        return text.strip()
+    except Exception as e:
+        return f"Error extracting text from image: {e}"
+
+
 
 
 if __name__ == "__main__":
